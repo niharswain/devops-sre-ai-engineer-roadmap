@@ -1,0 +1,5 @@
+flowchart LR
+  A[AWS account / root user] --> B[IAM groups]
+  B --> C[IAM users]
+  C --> D[Permissions from group policies]
+  C --> E[Policies attached directly to user]

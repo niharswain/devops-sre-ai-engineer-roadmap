@@ -1,0 +1,7 @@
+flowchart TD
+  U[Person or application] --> C[Management Console<br/>Password + MFA]
+  U --> L[AWS CLI<br/>Programmatic credentials]
+  U --> S[AWS SDK in application<br/>Programmatic credentials]
+  C --> A[AWS services]
+  L --> A
+  S --> A
