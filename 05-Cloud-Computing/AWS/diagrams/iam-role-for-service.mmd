@@ -1,0 +1,3 @@
+flowchart LR
+  R[IAM role with limited permissions] -->|assigned to| S[AWS service such as EC2 or Lambda]
+  S -->|performs permitted actions| A[Other AWS services or resources]
