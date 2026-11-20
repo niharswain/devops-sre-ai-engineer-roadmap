@@ -192,7 +192,7 @@ flowchart TD
 
 Review all relevant policy attachments when checking what a user can do.
 
-![IAM-Policy-Inheritance](/05-Cloud-Computing/AWS/diagrams/policy-inheritance.png)
+![IAM Policy Inheritance](./diagrams/policy-inheritance.png)
 
 ## Interview points
 
