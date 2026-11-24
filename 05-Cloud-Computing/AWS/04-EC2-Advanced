@@ -1,0 +1,677 @@
+# AWS — EC2 Networking, Placement Groups, ENI & Hibernate
+
+These pages cover five connected topics:
+
+1. **Private and public IP addresses** — how an EC2 instance is addressed inside a VPC and from the internet.
+2. **Elastic IP (EIP)** — how to keep a stable public IPv4 address.
+3. **EC2 placement groups** — how AWS places related instances on underlying infrastructure for performance or failure isolation.
+4. **Elastic Network Interface (ENI)** — the virtual network card and how it can be moved between instances in the same AZ.
+5. **EC2 Hibernate** — how to save RAM to an encrypted EBS root volume and resume an instance.
+
+### Remember these five lines
+
+- **Region:** a geographic AWS area containing multiple Availability Zones.
+- **Availability Zone (AZ):** an isolated infrastructure location inside a Region; it contains one or more data centers.
+- **Placement group:** tells EC2 how related instances should be positioned relative to one another.
+- **ENI:** a virtual network card with IP addresses and security-group associations; a secondary ENI can move between instances in the same AZ.
+- **Hibernate:** saves RAM to the encrypted EBS root volume; a normal Stop does not save RAM.
+
+---
+
+## 2. Region, Availability Zone, data center, rack and server
+
+This is the physical hierarchy to picture when AWS asks about placement groups.
+
+```mermaid
+flowchart TD
+    R["AWS Region: Asia Pacific (Mumbai)<br/>ap-south-1"]
+    R --> AZA["Availability Zone 1<br/>ap-south-1a"]
+    R --> AZB["Availability Zone 2<br/>ap-south-1b"]
+    R --> AZC["Availability Zone 3<br/>ap-south-1c"]
+    AZA --> DCA["One or more data-center facilities<br/>exact count not public"]
+    AZB --> DCB["One or more data-center facilities<br/>exact count not public"]
+    AZC --> DCC["One or more data-center facilities<br/>exact count not public"]
+    DCA --> RA1["Server racks"]
+    DCB --> RB1["Server racks"]
+    DCC --> RC1["Server racks"]
+    RA1 --> S1["Physical hosts / servers"]
+    RB1 --> S2["Physical hosts / servers"]
+    RC1 --> S3["Physical hosts / servers"]
+    S1 --> E1["EC2 instances"]
+    S2 --> E2["EC2 instances"]
+    S3 --> E3["EC2 instances"]
+```
+
+### Mumbai Region — visual example
+
+![Conceptual AWS Asia Pacific (Mumbai) Region infrastructure diagram](diagrams/aws-mumbai-region-az-hierarchy.svg)
+
+> **How to read this image:** Mumbai (`ap-south-1`) is the Region. It has three Availability Zones, shown using the example AZ names `ap-south-1a`, `ap-south-1b` and `ap-south-1c`. Each AZ contains one or more data-center facilities; those facilities contain racks and AWS-managed physical servers that host EC2 instances. The building drawings are conceptual only. AWS does not publish the exact Mumbai data-center building count, names, addresses or rack locations.
+
+**How to interpret it:**
+
+- **Region** is the broad geographic boundary, for example `ap-south-1` (Mumbai) or `ap-south-2` (Hyderabad).
+- **AZ** is a separate infrastructure location within that Region. An AZ consists of one or more discrete data centers with redundant power, networking and connectivity.
+- **Data center** is a physical facility. It contains the physical infrastructure, including server racks.
+- **Rack** is a physical enclosure holding servers and network/power equipment.
+- **Host/server** is the physical machine on which EC2 compute runs. AWS manages the underlying hardware; customers select EC2 instance types, not a specific rack or server.
+
+### Why AWS has multiple AZs
+
+AZs are designed as independent failure domains. If a local incident affects one AZ, an application deployed across other AZs can continue operating. AZs in a Region are connected with low-latency, high-bandwidth, highly redundant networking over dedicated metro fiber.
+
+**Important distinction:** multiple AZs in one Region help with an AZ-level failure. A second Region is used for a broader regional-disaster recovery strategy.
+
+### Current facts vs. the older slide
+
+- Current AWS documentation says each Region has **at least three AZs**. Do not memorise the old slide's “minimum 3, maximum 6” as a universal maximum; AZ counts vary by Region and AWS continues to expand infrastructure.
+- An AZ is not necessarily one building. It may contain one or more data centers.
+- AWS does not give customers a general control to choose an exact data-center building, rack number or physical host through EC2 placement groups.
+
+### Actual Region and Availability Zone examples (India + common interview examples)
+
+AWS Region names identify a geographic Region. AZ names are the familiar letter-based labels you see in the console and CLI. AWS also assigns each AZ a stable **AZ ID**, which identifies the same physical AZ across AWS accounts.
+
+| AWS Region name | Region code | Example AZ names shown to customers | AZ IDs published by AWS | Geography |
+|---|---|---|---|---|
+| Asia Pacific (Mumbai) | `ap-south-1` | `ap-south-1a`, `ap-south-1b`, `ap-south-1c` | `aps1-az1`, `aps1-az2`, `aps1-az3` | India (Mumbai Region) |
+| Asia Pacific (Hyderabad) | `ap-south-2` | `ap-south-2a`, `ap-south-2b`, `ap-south-2c` | `aps2-az1`, `aps2-az2`, `aps2-az3` | India (Hyderabad Region) |
+| US East (Ohio) | `us-east-2` | `us-east-2a`, `us-east-2b`, `us-east-2c` | `use2-az1`, `use2-az2`, `use2-az3` | Ohio, United States |
+
+**Important mapping warning:** Do not assume that `ap-south-1a` always means `aps1-az1` in every account. The letter-to-physical-AZ mapping may differ in certain older Regions/accounts. The AWS documentation explicitly gives `us-east-2` as a uniform example where `us-east-2a` maps to `use2-az1`, `us-east-2b` to `use2-az2`, and `us-east-2c` to `use2-az3`. For Mumbai and Hyderabad, use the live output from your own AWS account to see which AZ name corresponds to which AZ ID.
+
+### AZ name vs. AZ ID — important for multi-account environments
+
+An AZ name such as `us-east-1a` or `ap-south-1a` is the customer-facing label. In certain older Regions, accounts created before November 2025 can have different mappings between AZ letters and the physical AZ. AWS accounts created starting November 2025 receive consistent AZ-name mappings in those listed Regions. **AZ IDs** such as `use1-az1` or `aps1-az1` identify the same physical AZ across accounts.
+
+For cross-account VPC sharing, shared subnets, or architecture discussions, compare **AZ IDs**, not just the letter suffix. Check the mapping in your own account:
+
+```bash
+# Mumbai Region
+aws ec2 describe-availability-zones --region ap-south-1 \
+  --query 'AvailabilityZones[].{Name:ZoneName,AZ_ID:ZoneId,State:State}' \
+  --output table
+
+# Hyderabad Region
+aws ec2 describe-availability-zones --region ap-south-2 \
+  --query 'AvailabilityZones[].{Name:ZoneName,AZ_ID:ZoneId,State:State}' \
+  --output table
+```
+
+From an EC2 instance, the AZ name and AZ ID are available through instance metadata. Prefer IMDSv2:
+
+```bash
+TOKEN=$(curl -X PUT 'http://169.254.169.254/latest/api/token' \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')
+
+# AZ name, for example ap-south-1a
+curl -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone
+
+# Stable AZ ID, for example aps1-az1
+curl -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone-id
+```
+
+### Are individual AWS data centers given public names?
+
+Not in the way Regions and AZs are. AWS publicly identifies Regions and AZs (including AZ IDs) and describes an AZ as one or more discrete data centers. AWS does **not** expose customer-selectable names such as “Mumbai Data Center 1”, building addresses, rack numbers, or physical host names for ordinary EC2 placement. Customers select a Region/AZ and placement strategy; AWS manages the exact building, rack and host placement.
+
+**Remember the hierarchy:** `ap-south-1` (Mumbai Region) → an AZ such as `ap-south-1a` / its account-specific AZ ID → one or more AWS data-center facilities → racks → physical hosts → EC2 instances.
+
+**Interview line:** “A Region is a geographic boundary; an AZ is an isolated failure domain within the Region. An AZ contains one or more data centers, and data centers contain racks of physical servers. Placement groups influence how EC2 instances are distributed over that underlying infrastructure.”
+
+---
+
+## 3. Private IP vs. public IP
+
+An EC2 instance in a VPC normally has a **primary private IPv4 address** on its primary ENI. It may also have a public IPv4 address, depending on subnet and launch settings.
+
+| Address | What it means | Typical use |
+|---|---|---|
+| **Private IPv4** | Address from the VPC subnet; not directly reachable from the public internet | App-to-database traffic, internal service communication |
+| **Public IPv4** | Publicly routable IPv4 address mapped to the instance's private IPv4 by the Internet Gateway | Direct internet-facing EC2 access |
+| **Elastic IP** | Static public IPv4 address allocated to your AWS account | Stable public endpoint or address remapping during failover |
+| **IPv6** | 128-bit address; AWS VPC IPv6 addresses are globally unique | Modern dual-stack or IPv6-only connectivity |
+
+### Private IPv4 ranges to recognise
+
+The common RFC 1918 private ranges are:
+
+- `10.0.0.0/8`
+- `172.16.0.0/12`
+- `192.168.0.0/16`
+
+Example: `10.20.1.15` could be a private address assigned to an EC2 ENI in a VPC subnet such as `10.20.1.0/24`.
+
+A private IP is not directly reachable over the public internet. It can still communicate with other private networks through correctly configured VPC peering, Transit Gateway, Site-to-Site VPN, Direct Connect or other routed connectivity.
+
+### How a public IPv4 address works in a VPC
+
+A public IPv4 address is mapped to the ENI's private IPv4 address through the **Internet Gateway (IGW)**. The instance itself uses its private address inside the VPC; the IGW performs the public/private address translation for internet traffic.
+
+```mermaid
+flowchart LR
+    C["Internet client"] -->|Public IPv4| IGW["Internet Gateway<br/>one-to-one address mapping"]
+    IGW -->|Private IPv4| ENI["EC2 primary ENI"]
+    ENI --> EC2["EC2 instance"]
+    EC2 -->|Response via IGW| C
+```
+
+For IPv4 internet access, all of these must line up:
+
+1. The VPC has an Internet Gateway attached.
+2. The subnet route table has a route such as `0.0.0.0/0 → igw-...`.
+3. The instance/ENI has a public IPv4 address or Elastic IP.
+4. Security groups and network ACLs allow the required traffic.
+5. The operating system and application are listening on the expected port.
+
+**Public subnet does not automatically mean every instance is internet reachable.** A public subnet is defined by its route to an Internet Gateway. The instance still needs a public IPv4/EIP and allowed security rules.
+
+An instance in a private subnet commonly uses a **NAT Gateway** in a public subnet for outbound IPv4 internet access. This allows the private instance to initiate connections without making it directly reachable for unsolicited inbound internet connections.
+
+### Public IPv4 changes after Stop/Start
+
+- A private IPv4 address on the ENI normally remains the same after Stop/Start.
+- An automatically assigned public IPv4 address is released when the instance is stopped or hibernated. A new one is assigned when the instance starts again, if public IPv4 assignment is enabled.
+- An Elastic IP remains allocated to your account and can remain associated with the resource through Stop/Start.
+
+**Interview trap:** A public IP alone does not make an instance reachable. Check IGW attachment, route table, public IP assignment, security group, NACL and application listener.
+
+---
+
+## 4. Elastic IP (EIP)
+
+An **Elastic IP** is a static public IPv4 address allocated to your AWS account in a specific Region. It remains yours until you release it.
+
+### Why use one?
+
+Suppose an application or external partner has allow-listed `203.0.113.10`. If an EC2 instance is replaced and its automatically assigned public IPv4 changes, the allow-list breaks. An EIP provides a stable public IPv4 address that can be reassociated with another instance or network interface.
+
+```mermaid
+flowchart LR
+    EIP["Elastic IP<br/>203.0.113.10"] -->|Associated now| A["EC2-A / ENI"]
+    EIP -. "Reassociate during failover" .-> B["EC2-B / ENI"]
+```
+
+### Key points
+
+- EIP is **IPv4 only**; AWS Elastic IPs are not available for IPv6.
+- It is Region-specific; you cannot move an EIP directly to another Region.
+- It can be associated with an EC2 instance or a network interface/private IPv4 address.
+- You can disassociate it and associate it with another eligible resource in the same Region.
+- AWS charges for public IPv4 addresses, including in-use public IPv4 addresses and Elastic IPs. The published public IPv4 charge introduced on 1 February 2024 was **USD 0.005 per IP-hour**; check the current VPC pricing page before estimating a live bill.
+
+### Architecture guidance
+
+Do not assign an EIP to every web server by default. For a fleet of instances, prefer a load balancer and DNS-based endpoint. Use EIPs where a stable public IPv4 is genuinely required, such as a fixed partner allow-list or a controlled network endpoint.
+
+**Interview line:** “An EIP gives a stable public IPv4 address that I can remap to another instance or ENI during failover. It is Region-scoped, IPv4-only and billable, so I would use it only when a static public IP is a real requirement.”
+
+---
+
+## 5. EC2 Placement Groups — the most important section
+
+A **placement group** is a logical grouping that lets you influence how EC2 instances are positioned relative to each other on AWS infrastructure. It is not a VPC, subnet, load balancer or data-replication service.
+
+AWS currently documents **four** placement strategies:
+
+1. **Cluster** — pack instances close together for network performance.
+2. **Spread** — keep a small number of instances on distinct racks to reduce correlated hardware failure.
+3. **Partition** — separate large groups of instances into partitions that use different sets of racks.
+4. **Precision time** — place instances on supported hardware with access to high-precision time sources.
+
+### The simplest way to understand them
+
+Think about what you want from the physical placement:
+
+- Want instances **close together**? Choose **Cluster**.
+- Want every critical instance **separated from the others**? Choose **Spread**.
+- Want a large cluster divided into **independent rack groups**? Choose **Partition**.
+- Need **very accurate time**? Choose **Precision time**.
+
+### Visual comparison
+
+```mermaid
+flowchart TB
+    subgraph CL["CLUSTER — pack close together"]
+      direction LR
+      subgraph AZ1["One AZ"]
+        C1["EC2"] --- C2["EC2"] --- C3["EC2"]
+        C4["EC2"] --- C5["EC2"] --- C6["EC2"]
+      end
+    end
+    subgraph SP["SPREAD — separate individual instances"]
+      direction LR
+      R1["Rack 1<br/>EC2-A"]
+      R2["Rack 2<br/>EC2-B"]
+      R3["Rack 3<br/>EC2-C"]
+    end
+    subgraph PA["PARTITION — separate sets of racks"]
+      direction LR
+      P1["Partition 1<br/>Rack set A<br/>Many EC2s"]
+      P2["Partition 2<br/>Rack set B<br/>Many EC2s"]
+      P3["Partition 3<br/>Rack set C<br/>Many EC2s"]
+    end
+    subgraph PT["PRECISION TIME"]
+      T1["EC2 instances on supported hardware"] --> T2["Enhanced time source / PTP clock"]
+    end
+```
+
+*The diagram is a conceptual model, not a literal AWS rack layout.*
+
+### 5.1 Cluster placement group
+
+**Meaning:** EC2 packs instances close together within **one Availability Zone** in a high-bisection-bandwidth network segment.
+
+**Why choose it?** Low network latency and high throughput between instances. It is useful when most traffic is east-west (instance-to-instance), for example tightly coupled HPC, distributed compute or large data-processing jobs.
+
+**Important details:**
+
+- A Cluster placement group cannot span multiple AZs.
+- Instances are **not guaranteed to be on one rack**. “Close together” means close network placement, not a promise of one physical rack.
+- Use supported instance types and Enhanced Networking (ENA); for supported HPC workloads, Elastic Fabric Adapter (EFA) may also be appropriate.
+- Available network performance depends on the instance types and networking features. Do not memorise the slide's old “10 Gbps” statement as a universal guarantee.
+- Capacity can be difficult to obtain, especially when adding instances later or mixing instance types. AWS recommends launching the required fleet together and using the same instance type where practical.
+
+**Trade-off:** Great performance, but one AZ is the placement boundary. An AZ outage can affect the whole group. Do not choose Cluster when the primary requirement is AZ-level isolation.
+
+**Example:** 16 tightly coupled compute nodes exchange large amounts of data and need low-latency node-to-node communication.
+
+### 5.2 Spread placement group
+
+**Meaning:** EC2 places each instance on distinct underlying hardware—at rack level in AWS Regions—so that one rack failure is less likely to affect multiple instances in the group.
+
+**Think:** one critical server per separate rack.
+
+**Key limits and facts:**
+
+- Rack-level Spread placement groups are supported in AWS Regions and can span multiple AZs in the **same Region**.
+- Maximum **seven running instances per AZ per rack-level Spread placement group**.
+- In a three-AZ Region, a single group could therefore support up to 21 running instances in total, provided seven are placed in each AZ and capacity is available.
+- Host-level Spread is supported on AWS Outposts; it is not the standard Regional EC2 Spread option.
+- If you need more than seven instances in one AZ, AWS recommends considering multiple Spread groups. Separate groups do not guarantee isolation from each other, but each group provides its own spread guarantee.
+
+**Use it for:** a small number of critical instances that must be isolated from one another, such as a small set of highly available controllers or important infrastructure nodes.
+
+**Trade-off:** Strong individual isolation, but the seven-per-AZ limit makes it unsuitable for very large fleets.
+
+### 5.3 Partition placement group
+
+**Meaning:** EC2 divides a large workload into logical **partitions**. Each partition gets its own set of racks. Instances in different partitions do not share those racks.
+
+This is the part that often causes confusion:
+
+- A **partition is a group of racks**, not one EC2 instance and not necessarily one rack.
+- Multiple EC2 instances can be in the same partition. They can share that partition's rack set.
+- Another partition uses a different rack set, so a rack-level failure in Partition 1 should not affect the hardware used by Partition 2.
+
+```mermaid
+flowchart TB
+    subgraph AZ["Availability Zone (one example AZ)"]
+      subgraph P1["Partition 1 — rack set A"]
+        A1["Rack A1"]
+        A2["Rack A2"]
+        A3["EC2 instances"]
+      end
+      subgraph P2["Partition 2 — rack set B"]
+        B1["Rack B1"]
+        B2["Rack B2"]
+        B3["EC2 instances"]
+      end
+      subgraph P3["Partition 3 — rack set C"]
+        C1["Rack C1"]
+        C2["Rack C2"]
+        C3["EC2 instances"]
+      end
+    end
+```
+
+**Key facts:**
+
+- A Partition placement group can span multiple AZs in the same Region.
+- Maximum **seven partitions per AZ** in one group.
+- The number of EC2 instances is constrained by account/service quotas and available capacity—not a fixed “hundreds only” ceiling.
+- AWS attempts to distribute instances evenly across the partitions you specify, but does not guarantee a perfectly even distribution.
+- EC2 exposes the partition number through instance metadata. Topology-aware applications can use it to place replicas in different partitions.
+
+**Use it for:** large distributed and replicated systems such as Kafka, Cassandra, HDFS and HBase.
+
+**Why is it useful for Kafka/Cassandra?** These systems replicate data across nodes. If replicas are deliberately placed in different partitions, a rack or partition-level infrastructure issue is less likely to remove all copies at once. The application must still configure replication correctly; the placement group does not replicate data for you.
+
+### 5.4 Precision time placement group
+
+**Meaning:** places instances on supported hardware with direct access to high-precision time sources in AWS infrastructure.
+
+It provides:
+
+- An enhanced local Amazon Time Sync Service source.
+- A PTP Hardware Clock (PHC) device for microsecond-accurate synchronization on supported Linux instances.
+- Hardware packet timestamping for nanosecond-resolution network measurements on supported Linux instances.
+
+**Use it for:** financial timestamping, distributed databases that need accurate transaction ordering, and distributed systems that compare event times.
+
+**Do not confuse it with:** a low-latency Cluster group or a failure-isolation Spread group. Its special property is **time accuracy**. Hardware availability and supported instance families must be checked; a launch can fail if the AZ does not have suitable hardware. There is no additional charge for the Precision Time placement group itself.
+
+**Advanced note:** AWS also supports creating a Cluster placement group with a parent Precision Time placement group when you need both cluster-style network placement and precision-time hardware.
+
+### Placement group decision table
+
+| Requirement / scenario | Choose | Why |
+|---|---|---|
+| Lowest network latency between tightly coupled EC2 nodes | **Cluster** | Packs instances close in one AZ |
+| Small number of critical instances must be on different racks | **Spread** | Distinct underlying racks; max 7 running instances per AZ per Regional group |
+| Large Kafka/Cassandra/HDFS fleet needs rack-set isolation | **Partition** | Many instances across logical partitions; up to 7 partitions per AZ |
+| Microsecond-accurate clock synchronization or precise timestamps | **Precision time** | Access to enhanced time source / PTP hardware |
+
+### Placement group rules to remember
+
+- An instance can belong to **only one placement group at a time**.
+- A placement group influences relative placement; it does not replace load balancing, replication, Auto Scaling or multi-AZ design.
+- Placement groups themselves have no creation charge; the EC2 instances and associated resources are billed normally.
+- Launching or restarting can fail if suitable capacity is unavailable. A placement group is not a capacity reservation.
+- If no placement group is specified, EC2 manages placement and attempts to reduce correlated failures by spreading instances across the underlying hardware.
+
+**30-second interview answer:** “Placement groups control how EC2 instances are positioned relative to one another. Cluster packs instances in one AZ for low latency and high throughput. Spread isolates a small number of instances on separate racks, up to seven per AZ in a Regional group. Partition separates large fleets into rack-isolated groups and can span AZs in one Region. Precision time provides access to high-accuracy time sources. I choose based on whether the requirement is performance, failure isolation or clock accuracy.”
+
+---
+
+## 6. Elastic Network Interface (ENI)
+
+### Explain ENI in one simple sentence
+
+An **ENI is a virtual network card** attached to an EC2 instance. It carries the instance's network identity—IP addresses, security groups and MAC address.
+
+On a physical laptop, you may have a network card with an IP and MAC address. ENI is the AWS virtual equivalent, managed as a separate VPC resource.
+
+### What can an ENI contain?
+
+An ENI can have:
+
+- One primary private IPv4 address.
+- One or more secondary private IPv4 addresses.
+- One primary IPv6 address and optional secondary IPv6 addresses, where IPv6 is configured.
+- A public IPv4 address, if configured.
+- Elastic IP associations (one EIP per private IPv4 address).
+- One or more security groups.
+- A MAC address.
+- A source/destination check setting and other interface attributes.
+
+### Primary ENI vs. secondary ENI
+
+- Every EC2 instance has a **primary ENI**. It cannot be detached from the instance.
+- You can attach additional **secondary ENIs**, subject to the instance type's network-interface limits.
+- A secondary ENI can be detached and attached to another EC2 instance, provided the target instance is in the **same AZ**.
+- The ENI is created in a subnet and cannot be moved to another subnet after creation. Because a subnet belongs to one AZ, the ENI is AZ-bound.
+- When the ENI moves, its network attributes move with it. Traffic destined for that ENI is redirected to the new instance after attachment.
+
+### Visual: ENI-based failover
+
+```mermaid
+flowchart TB
+    subgraph AZ1["One Availability Zone — same AZ is mandatory"]
+      ENI["Secondary ENI<br/>Private IP: 10.0.1.50<br/>Security Group + MAC"]
+      A["EC2-A<br/>Active"]
+      B["EC2-B<br/>Standby"]
+      ENI -->|Initially attached| A
+      ENI -. "Detach, then attach during failover" .-> B
+    end
+    CLIENT["Client / other VPC resources"] -->|Same private IP| ENI
+```
+
+**Step-by-step example:**
+
+1. Create an ENI in a subnet in `ap-south-1a`, with a known private IP and the required security group.
+2. Attach it to EC2-A as a secondary ENI.
+3. Keep EC2-B ready in the **same AZ**.
+4. If EC2-A fails, your automation or operations process detaches the secondary ENI from EC2-A and attaches it to EC2-B.
+5. EC2-B now uses the ENI's private IP and security-group configuration. An EIP associated with that ENI/private IP can remain with it.
+
+**Why is this useful?** Clients or dependent systems can continue using the same private IP while the workload is moved to a standby instance. It is useful for controlled failover and network appliances.
+
+### ENI limitations — interview traps
+
+- **Same AZ only:** you cannot move an ENI from AZ-A to AZ-B. For cross-AZ resilience, use a different ENI in the other AZ and an endpoint/failover design such as a load balancer, DNS failover or Global Accelerator.
+- **Primary ENI cannot be detached.** Use a secondary ENI for this type of failover.
+- The maximum number of ENIs depends on the EC2 instance type.
+- ENI attachment is not instantaneous application recovery. Your application, health checks, data consistency and failover automation must also be designed.
+- If multiple interfaces are attached, the OS routing configuration matters; careless multi-homing can cause asymmetric routing.
+
+### Source/destination check
+
+By default, EC2 expects traffic to be sourced from or destined for the instance itself. This is the **source/destination check**.
+
+Disable it when an EC2 instance is intentionally forwarding traffic for other systems—for example, a NAT instance, router or firewall appliance. Otherwise, forwarded packets may be dropped.
+
+### ENI vs. EIP — don't mix them up
+
+| ENI | Elastic IP |
+|---|---|
+| A virtual network interface | A static public IPv4 address |
+| Has private IPs, security groups, MAC address and other attributes | Provides a stable public IPv4 endpoint |
+| Bound to one subnet/AZ | Bound to one AWS Region |
+| A secondary ENI can move to another instance in the same AZ | Can be reassociated to another eligible resource in the same Region |
+
+**Interview line:** “I use a secondary ENI when I need a network identity—such as a private IP and security-group configuration—to move from one EC2 instance to another during failover. The critical limitation is that an ENI is AZ-bound, so this is same-AZ failover, not cross-AZ disaster recovery.”
+
+---
+
+## 7. EC2 Hibernate
+
+### Stop vs. Hibernate vs. Terminate
+
+| Action | RAM | EBS volumes | Instance store | Instance |
+|---|---|---|---|---|
+| **Stop** | Lost | Data persists | Data lost | Can be started again |
+| **Hibernate** | Saved to encrypted EBS root volume and restored on start | Data persists | Data lost | Resumes previous in-memory state when started |
+| **Terminate** | Lost | Volumes marked `DeleteOnTermination=true` are deleted; others can persist | Lost | Permanently deleted |
+
+### How Hibernate works
+
+Hibernate is similar to a laptop's “Hibernate” option:
+
+1. EC2 signals the operating system to hibernate (suspend to disk).
+2. The OS freezes processes and writes the RAM contents to the **EBS root volume**.
+3. The instance shuts down and enters the `stopped` state.
+4. On start, the OS restores RAM from the root EBS volume and resumes the processes.
+
+```mermaid
+flowchart TD
+    RUN["EC2 running<br/>Application + RAM"] --> H["Hibernate requested"]
+    H --> SAVE["RAM is written to encrypted EBS root volume"]
+    SAVE --> STOP["Instance becomes stopped"]
+    STOP --> START["Start instance"]
+    START --> RESTORE["RAM contents restored"]
+    RESTORE --> RESUME["Processes resume from prior state"]
+```
+
+### When should you use it?
+
+Use Hibernate when an instance takes a long time to initialise and you want to preserve its in-memory state—for example, a pre-warmed application or a long-running process that benefits from resuming its state.
+
+Do not treat Hibernate as a replacement for application-level checkpointing, backups or high availability.
+
+### Current prerequisites and limits
+
+- Hibernation must be enabled **when the instance is launched**. It cannot be enabled later on an already-created instance.
+- The instance must use an EBS-backed root volume; instance-store root volumes are not supported.
+- The root EBS volume must be **encrypted** and large enough for the RAM contents plus the OS/application data.
+- The AMI and instance family must support hibernation. Check the current AWS list; do not rely on the old family list in the slides.
+- Current RAM limits: Linux must have **less than 150 GiB**; Windows must have **16 GiB or less**.
+- Bare-metal instance types are not supported.
+- AWS does not support leaving an instance hibernated for more than **60 days**.
+- Hibernated instances are in the `stopped` state. EBS storage is still billed; compute usage is not billed while stopped.
+- Instance-store data is lost. Automatically assigned public IPv4 is released; private IPs, IPv6 addresses and associated EIPs are retained.
+- An instance in an Auto Scaling group should not be manually hibernated as a normal operating procedure; Auto Scaling can mark it unhealthy and replace it.
+
+**Interview line:** “Stop shuts down the OS and loses RAM. Hibernate writes RAM to an encrypted EBS root volume and restores it on start, so processes can resume. It must be enabled at launch, needs a supported AMI and instance type, and requires a sufficiently large encrypted EBS root volume.”
+
+---
+
+## 8. Scenario-based interview practice
+
+Try answering each question before reading the suggested answer.
+
+### Q1. You have 20 EC2 instances that exchange large volumes of data and need very low network latency. Which placement group?
+
+**Answer:** Cluster placement group. It packs instances close together in one AZ for low latency and high throughput. If AZ-level resilience is required too, design a separate multi-AZ architecture; a Cluster group cannot span AZs.
+
+### Q2. You run three critical application nodes and want each on separate physical racks. Which placement group?
+
+**Answer:** Spread placement group. In AWS Regions, rack-level Spread allows up to seven running instances per AZ per group and can span AZs within a Region.
+
+### Q3. You are deploying a 60-node Kafka cluster and want to reduce the impact of a rack failure. Which placement group?
+
+**Answer:** Partition placement group. Place broker replicas in different partitions; each partition uses a separate rack set. Configure Kafka replication across partitions/AZs as appropriate—the placement group does not replicate data.
+
+### Q4. What is the difference between Spread and Partition?
+
+**Answer:** Spread separates individual instances and is for a small number of critical nodes (maximum seven per AZ per Regional group). Partition separates groups of instances into distinct rack sets and is designed for large distributed fleets (up to seven partitions per AZ).
+
+### Q5. Can a Cluster placement group span two AZs?
+
+**Answer:** No. Cluster placement groups are limited to one AZ. Partition and rack-level Spread groups can span multiple AZs in the same Region.
+
+### Q6. A server must keep the same private IP when it fails over to a standby EC2 instance. What AWS feature can help?
+
+**Answer:** A secondary ENI. Detach it from the failed instance and attach it to a standby instance in the same AZ. Its private IP and security-group configuration move with it.
+
+### Q7. Can an ENI be moved from `ap-south-1a` to `ap-south-1b`?
+
+**Answer:** No. An ENI belongs to a subnet/AZ and can be attached only to an instance in the same AZ. Use a cross-AZ service endpoint/failover pattern instead.
+
+### Q8. A public EC2 IPv4 address changes after Stop/Start. How do you keep it fixed?
+
+**Answer:** Allocate an Elastic IP and associate it with the instance or ENI. Remember that public IPv4 addresses, including EIPs, are billable.
+
+### Q9. An EC2 instance has a public IP but cannot be reached from the internet. What do you check?
+
+**Answer:** IGW attached to the VPC, subnet route `0.0.0.0/0 → IGW`, public IPv4/EIP association, security-group inbound rules, NACL rules, host firewall and application listener.
+
+### Q10. You need microsecond-accurate timestamping for a financial application. Which placement group?
+
+**Answer:** Precision time placement group. It provides access to enhanced time sources; supported Linux instances can use a PTP Hardware Clock and hardware packet timestamping.
+
+### Q11. You need to preserve a process's memory so it resumes after an EC2 shutdown. What do you use?
+
+**Answer:** EC2 Hibernate, configured at launch, with a supported AMI/instance type and sufficiently large encrypted EBS root volume.
+
+### Q12. Can you use a placement group as a substitute for Multi-AZ architecture?
+
+**Answer:** No. Placement groups control relative placement and failure isolation at the rack/host level. Use multiple AZs and application-level replication/load balancing for AZ resilience.
+
+---
+
+## 9. Quick revision sheet
+
+| Term | Remember this |
+|---|---|
+| Region | Geographic AWS area; contains multiple AZs |
+| AZ | Isolated infrastructure location; one or more data centers |
+| AZ ID | Stable physical AZ identifier across AWS accounts |
+| Private IPv4 | Internal VPC address; retained through Stop/Start |
+| Auto-assigned public IPv4 | Released on Stop/Hibernate; new one on Start |
+| Elastic IP | Static, Region-scoped public IPv4; billable |
+| Cluster | Pack close; performance; one AZ; not same-rack guarantee |
+| Spread | Separate instances on distinct racks; max 7 running/AZ/group in Regions |
+| Partition | Separate rack sets per partition; max 7 partitions/AZ; supports large fleets |
+| Precision time | Enhanced time source, PTP clock and packet timestamping on supported Linux instances |
+| ENI | Virtual NIC with IPs, SGs and MAC; subnet/AZ-bound |
+| Secondary ENI | Can move between EC2 instances in the same AZ |
+| Source/destination check | Disable on an instance that forwards traffic (NAT/router/firewall) |
+| Stop | RAM lost; EBS data persists; auto public IPv4 released |
+| Hibernate | RAM saved to encrypted EBS root volume; resume processes on start |
+| Terminate | Instance deleted; EBS volumes with DeleteOnTermination enabled are deleted |
+
+### Common mistakes to avoid
+
+- Do not say that a Cluster group guarantees instances share one physical rack.
+- Do not say that a Spread group supports unlimited instances; Regional rack-level Spread is capped at seven running instances per AZ per group.
+- Do not confuse a Partition with one EC2 instance or one rack. A partition is a logical group with its own rack set.
+- Do not say an ENI can move between AZs. It cannot.
+- Do not say a public IPv4 address is free or permanent. Auto-assigned public IPv4 changes on Stop/Start, and public IPv4 addresses are charged.
+- Do not confuse an EIP (public IPv4 endpoint) with an ENI (virtual network card).
+- Do not say Stop preserves RAM. Only Hibernate saves RAM state.
+- Do not use placement groups as a substitute for data replication, load balancing or multi-AZ design.
+
+---
+
+## 10. AWS CLI and metadata commands worth knowing
+
+### Show AZ names and their stable AZ IDs
+
+```bash
+aws ec2 describe-availability-zones \
+  --query 'AvailabilityZones[].{Name:ZoneName,AZ_ID:ZoneId,State:State}' \
+  --output table
+```
+
+### List network interfaces
+
+```bash
+aws ec2 describe-network-interfaces \
+  --query 'NetworkInterfaces[].{ENI:NetworkInterfaceId,AZ:AvailabilityZone,PrivateIP:PrivateIpAddress,Status:Status,Instance:Attachment.InstanceId}' \
+  --output table
+```
+
+### Read the instance's AZ ID with IMDSv2
+
+Run from inside the EC2 instance:
+
+```bash
+TOKEN=$(curl -X PUT \
+  "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+curl -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone-id
+```
+
+### Read the placement-group name and partition number
+
+```bash
+# Placement group name (empty if the instance is not in a placement group)
+curl -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/group-name
+
+# Partition number (relevant to Partition placement groups)
+curl -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/partition-number
+```
+
+Use IMDSv2 and protect access to instance metadata in production. These examples assume the token command above has been run in the same shell.
+
+---
+
+## 11. Official references for deeper study
+
+Use these current AWS pages as the source of truth when limits, supported instance families or pricing change.
+
+1. [AWS Regions and Availability Zones](https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-availability-zones.html)
+2. [AZ IDs and cross-account AZ mapping](https://docs.aws.amazon.com/global-infrastructure/latest/regions/az-ids.html)
+3. [EC2 placement strategies — Cluster, Partition, Spread and Precision time](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/placement-strategies.html)
+4. [EC2 placement groups overview and rules](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/placement-groups.html)
+5. [Elastic Network Interfaces](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html)
+6. [Create a network interface](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/create-network-interface.html)
+7. [VPC IP addressing](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-ip-addressing.html)
+8. [Internet Gateway and IPv4 NAT behavior](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html)
+9. [Elastic IP addresses and pricing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html)
+10. [EC2 hibernation overview and limitations](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-hibernate-overview.html)
+11. [EC2 hibernation prerequisites](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hibernating-prerequisites.html)
+12. [AWS public IPv4 address charge announcement](https://aws.amazon.com/blogs/aws/new-aws-public-ipv4-address-charge-public-ip-insights/)
+13. [AWS Builder Center — Global infrastructure examples, including Mumbai and Hyderabad](https://builder.aws.com/content/3GcrI5ePMTRJlMMPGMG1FBNVOS6/aws-cloud-practitioner-part-2-global-infrastructure)
+14. [AWS in India — Mumbai Region and its three Availability Zones](https://aws.amazon.com/local/india/)
+
+---
+
+## 12. Self-check: can you explain these without looking?
+
+- [ ] Explain Region → AZ → data center → rack → host in your own words.
+- [ ] Explain why AZ IDs matter when two AWS accounts share subnets.
+- [ ] Explain the difference between private IPv4, public IPv4 and EIP.
+- [ ] Draw the IGW public-to-private IPv4 mapping and explain why a public IP alone is insufficient.
+- [ ] Explain Cluster vs. Spread vs. Partition with one use case each.
+- [ ] Explain why a Partition can contain many instances but a Regional Spread group is limited to seven running instances per AZ.
+- [ ] Explain what an ENI carries and why a secondary ENI cannot move to another AZ.
+- [ ] Explain Stop vs. Hibernate vs. Terminate, including what happens to RAM, EBS, instance store and public IP.
+
